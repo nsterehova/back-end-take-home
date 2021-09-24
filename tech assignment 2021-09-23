@@ -1,0 +1,268 @@
+#/usr/env python
+
+# endpoint that allows users to search a data set:
+# Airport, Airline, and Route data.
+# Users of the API will be able to search for routes given an origin and destination.
+
+import urllib, os, csv
+
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+# host and port for the web server
+host = 'localhost'
+port = 8080
+
+class myWebServer(BaseHTTPRequestHandler):
+    
+    def do_GET(self):
+        # initilize all data needed
+        self.airlines = {}
+        self.airports = {}
+        self.routes = {}
+
+        # params from the url    
+        o = urllib.parse.urlparse(self.path)
+        params = dict(urllib.parse.parse_qsl(o.query))
+
+        self.mode = params.get('mode') == 'test' and '_test' or ''                    
+        self.show_all_routes = params.get('show_all_routes')
+        self.max_connections = params.get('max_connections') or 99
+
+        # default result to an empty string
+        res = ''
+        
+        # show all alirlines        
+        if o.path == '/get_airlines':
+            lines = self.get_file_content('airlines{}.csv'.format(self.mode))
+            res = self.print_file_content(lines)
+            
+        # show all ariports    
+        elif o.path == '/get_airports':
+            lines = self.get_file_content('airports{}.csv'.format(self.mode))
+            res = self.print_file_content(lines)
+            
+        # show all routes
+        elif o.path == '/get_routes':
+            lines = self.get_file_content('routes{}.csv'.format(self.mode))
+            res = self.print_file_content(lines)
+            
+        # find the route
+        elif o.path == '/get_route':
+            self.get_airlines()
+            self.get_airports()
+            self.get_routes()
+
+            # some basic validation to ensure we have all data needed            
+            if not (self.airlines):
+                res = 'No Airlines found.'
+            elif not (self.airports):
+                res = 'No Airports found.'
+            elif not (self.routes):
+                res = 'No Routes found.'
+            else:
+                res = self.find_route(params)
+        else:
+            res = f'Method {o.path} is not recognized'        
+
+        self.send_response(200)
+        self.send_header("Content-type", "application/json")
+        self.end_headers()
+    
+        self.wfile.write(bytes(res, encoding='utf8'))
+    
+    def do_POST(self):
+        pass
+
+    def get_airlines(self):
+        # get all airlines provided in the file
+        lines = self.get_file_content('airlines{}.csv'.format(self.mode))
+        self.airlines = {}
+        for x in lines[1:]:
+            if len(x) > 3:
+                self.airlines[x[1]] = {
+                    'name': x[0],
+                    'code3digits': x[2],
+                    'country': x[3]
+                    }
+            else:
+                self.airlines[x[1]] = {
+                    'name': x[0],
+                    'country': x[2]
+                    }
+                
+    def get_airports(self):
+        # get all airports provided in the file
+        lines = self.get_file_content('airports{}.csv'.format(self.mode))
+        self.airports = {}
+        for x in lines[1:]:
+            self.airports[x[3]] = {
+                'name': x[0],
+                'city': x[1],
+                'country': x[2],
+                'latitute': x[4],
+                'longitude': x[5]
+                }
+
+    def get_routes(self):
+        # get all routes provided in the file
+        lines = self.get_file_content('routes{}.csv'.format(self.mode))
+        self.routes = {}
+        for x in lines[1:]:
+            self.routes[(x[1], x[2])] = {
+                'airline_code': x[0],
+                }
+            
+    def find_route(self, params):
+        # find the route for given origin and destination airports
+        self.origin = params.get('origin')
+        self.destination = params.get('destination')
+        
+        # origin is mandatory and must exists
+        if not self.origin:
+            return('Missing Origin')
+        elif not self.airports.get(self.origin):
+            return('Invalid Origin')
+
+        # destination is mandatory and must exists
+        if not self.destination:
+            return('Missing Destination')
+        elif not self.airports.get(self.destination):
+            return('Invalid Destination')
+
+        # both are given and exist
+        # origin and destination can not be matching
+        if self.origin == self.destination:
+            return('Origin and Destination are matching.')
+
+        # default the result to return to be an empty string
+        res = ''
+        
+        # get all possible routes as a dictionary with the key as departure/origin airport
+        # and value as all possible destination()
+        self.all_routes = {}
+        for o, d in self.routes:
+            if o not in self.all_routes:
+                self.all_routes[o] = []
+            self.all_routes[o].append(d)
+
+        # first check if there is a direct flight
+        if self.destination in self.all_routes.get(self.origin, []):
+            res = f"\r\n{self.origin} -> {self.destination}"
+            return res
+
+        # now loop through all destinations available for the origin
+        # final dictionary will have routes found for each it's destination
+        all_selected_routes = {}
+        for num, dest in enumerate(self.all_routes[self.origin]):
+            curr_selected_routes = []   
+            self.get_next_route(dest, curr_selected_routes)
+            all_selected_routes[dest] = curr_selected_routes
+            
+        return self.print_selected_routes(all_selected_routes)
+    
+    def get_next_route(self, origin, selected_routes):
+        # route with the destination found
+        if self.destination in self.all_routes.get(origin, []):
+            selected_routes.append(self.destination)
+            return
+
+        # loop through all possible destinations for the origin provided
+        for dest in self.all_routes.get(origin, []):
+            # skip if tuple is already present
+            if dest in selected_routes: continue
+            # skip a return flight
+            if dest == self.origin: continue
+            # skip if dest is already present  in the list
+            if dest in selected_routes: continue
+            
+            selected_routes.append(dest)
+            return self.get_next_route(dest, selected_routes)
+
+        # no destination for the origin found
+        return
+    
+    def print_selected_routes(self, selected_routes):
+        # no routes found
+        if not selected_routes:
+            return 'No Route'
+
+        # default the result to be an empty string
+        res = ''
+        
+        # show all found routes if show_all_routes provided
+        if self.show_all_routes == 'true':
+            for next_dest, destinations in selected_routes.items():
+                if destinations and destinations[-1] == self.destination:
+                    res += f"\r\n{self.origin} -> {next_dest} -> "
+                    res += ' -> '.join(destinations)
+
+        # find the shortest by checking number of connectins flights found
+        # looping through the range of maximum set
+        # starting with the 2 (shortest if the direct flight not found)
+        else:
+            found = False
+            for num_connections in range(2, self.max_connections):
+                if found: break
+                for next_dest, destinations in selected_routes.items():
+                    if destinations and destinations[-1] == self.destination and len(destinations) == num_connections:
+                        found = True
+                        break
+            if found:
+                # last iteration in the loop has minimum of flights connections
+                res += f"\r\n{self.origin} -> {next_dest} -> "
+                res += ' -> '.join(destinations)
+            else:
+                res = 'No Route'
+        
+        return res
+        
+    def print_file_content(self, lines):
+        # helpful function to show the content of the file as lines provided
+        if not lines:
+            return 'No data found'
+        
+        # get columns max length list
+        columns_max = {}
+        lines_num = len(lines)
+        columns_num = len(lines[0])
+        
+        for x in range(columns_num):            
+            columns_max[x] = max([len(lines[y][x]) for y in range(len(lines))])
+                
+        html_str = ''
+        for line in lines:
+            for x, col in enumerate(line):
+                html_str += col.ljust(columns_max[x] + 1)
+            html_str += '\r\n'
+        
+        return html_str
+        
+    def get_file_content(self, file_name):
+        # helpful function to get the content of the file provided
+        
+        # check if file exists
+        if not os.path.exists(file_name):
+            return f'File {file_name} not found'
+        
+        # get the file content
+        lines = []
+        with open(file_name, encoding='utf-8') as csv_file:
+            fo = csv.reader(csv_file, delimiter='\t')
+            for line in fo:
+                lines.append(line)
+        return lines        
+    
+if __name__ == '__main__':
+    
+    web_server = HTTPServer((host, port), myWebServer)
+    print(f'web server started {host}:{port}')
+   
+    try:
+        web_server.serve_forever()
+    except KeyboardInterrupt:
+        print('\n\rstopping...')
+        pass
+    
+    web_server.server_close()
+    print('\n\rServer stopped')
+    
